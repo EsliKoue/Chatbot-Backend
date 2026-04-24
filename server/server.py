@@ -1,44 +1,44 @@
 import uuid
 import os
-import time
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from agent import creer_session, envoyer_message
 
-# =====================
-# CONFIG
-# =====================
+
+# CONFIGURATION Configuration du serveur FastAPI
 
 app = FastAPI(
-    title="AI Portfolio Chatbot",
-    description="Backend IA pour chatbot intelligent",
-    version="2.0.0",
+    title="Portfolio Chatbot API",
+    description="Backend IA pour le chatbot du portfolio",
+    version="1.0.0",
 )
 
-# ⚠️ CORS sécurisé
-FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
-
+# CORS — autorise le frontend à communiquer
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[FRONTEND_URL],
+    allow_origins=[
+        "http://localhost:3000",
+        "http://localhost:3001",
+        "http://localhost:5173",      # Vite
+        "http://localhost:8082",
+        "http://localhost:8083",
+        "http://127.0.0.1:5173",
+        "http://127.0.0.1:5500",
+        "*",  # À remplacer par le domaine réel en production
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# =====================
-# STOCKAGE (temporaire)
-# =====================
+# Stockage en mémoire des sessions
+sessions: dict[str, list] = {}
 
-sessions = {}
-last_access = {}
 
-SESSION_TIMEOUT = 3600  # 1h
 
-# =====================
-# SCHEMAS
-# =====================
+# Schemas pydantic pour les requêtes et réponses de l'API
+
 
 class NouvelleSessionReponse(BaseModel):
     session_id: str
@@ -55,99 +55,107 @@ class MessageReponse(BaseModel):
     session_id: str
 
 
-# =====================
-# UTILITAIRE
-# =====================
+# Routes de l'API
 
-def nettoyer_sessions():
-    """Supprime les sessions expirées"""
-    now = time.time()
-    expired = [
-        sid for sid, t in last_access.items()
-        if now - t > SESSION_TIMEOUT
-    ]
-    for sid in expired:
-        sessions.pop(sid, None)
-        last_access.pop(sid, None)
-
-
-# =====================
-# ROUTES
-# =====================
 
 @app.get("/")
 def accueil():
-    return {"status": "ok", "message": "API Chatbot active"}
+    """Route de test pour vérifier que le serveur est actif."""
+    return {
+        "statut": "ok",
+        "message": "Portfolio Chatbot Backend actif et prêt à recevoir des messages !",
+        "api": "FastAPI",
+    }
 
 
 @app.post("/session/nouvelle", response_model=NouvelleSessionReponse)
 def nouvelle_session():
-    nettoyer_sessions()
-
+    """
+    Crée une nouvelle session de conversation.
+    À appeler quand un visiteur ouvre le chatbot pour la première fois.
+    """
     session_id = str(uuid.uuid4())
     sessions[session_id] = creer_session()
-    last_access[session_id] = time.time()
-
     return {
         "session_id": session_id,
-        "message": "Session créée",
+        "message": "Session créée avec succès",
     }
 
 
 @app.post("/chat", response_model=MessageReponse)
-def chat(req: MessageRequete, request: Request):
-
-    nettoyer_sessions()
-
-    if req.session_id not in sessions:
-        raise HTTPException(404, "Session introuvable")
-
-    message = req.message.strip()
+def chat(requete: MessageRequete):
+    """
+    Envoie un message au chatbot et reçoit une réponse.
+    
+    Body JSON attendu :
+    {
+        "session_id": "uuid-...",
+        "message": "Ta question ici"
+    }
+    """
+    
+    # Vérifier la session
+    if requete.session_id not in sessions:
+        raise HTTPException(
+            status_code=404,
+            detail="Session introuvable. Créez d'abord une session via /session/nouvelle"
+        )
+    
+    # Vérifier le message
+    message = requete.message.strip()
     if not message:
-        raise HTTPException(400, "Message vide")
-
-    # Anti-spam simple
-    if len(message) > 1000:
-        raise HTTPException(400, "Message trop long")
-
-    historique = sessions[req.session_id]
-
-    try:
-        reponse, new_hist = envoyer_message(historique, message)
-    except Exception as e:
-        raise HTTPException(500, "Erreur IA")
-
-    sessions[req.session_id] = new_hist
-    last_access[req.session_id] = time.time()
-
+        raise HTTPException(
+            status_code=400,
+            detail="Le message ne peut pas être vide"
+        )
+    
+    # Obtenir l'historique
+    historique = sessions[requete.session_id]
+    
+    # Appeler l'agent
+    reponse_texte, historique_mis_a_jour = envoyer_message(historique, message)
+    
+    # Sauvegarder
+    sessions[requete.session_id] = historique_mis_a_jour
+    
     return {
-        "reponse": reponse,
-        "session_id": req.session_id,
+        "reponse": reponse_texte,
+        "session_id": requete.session_id,
     }
 
 
 @app.delete("/session/{session_id}")
 def supprimer_session(session_id: str):
-    sessions.pop(session_id, None)
-    last_access.pop(session_id, None)
-    return {"message": "Session supprimée"}
+    """
+    Supprime une session (libère la mémoire).
+    À appeler quand le visiteur ferme le chatbot.
+    """
+    if session_id in sessions:
+        del sessions[session_id]
+        return {"message": "Session supprimée avec succès"}
+    raise HTTPException(status_code=404, detail="Session introuvable")
 
 
 @app.get("/session/{session_id}/historique")
-def historique(session_id: str):
+def obtenir_historique(session_id: str):
+    """Retourne l'historique complet d'une session (debug)."""
     if session_id not in sessions:
-        raise HTTPException(404, "Session introuvable")
-
+        raise HTTPException(status_code=404, detail="Session introuvable")
     return {
+        "session_id": session_id,
         "nb_messages": len(sessions[session_id]),
         "historique": sessions[session_id],
     }
 
 
-# =====================
-# RUN
-# =====================
+# Démarre le serveur
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("server:app", host="0.0.0.0", port=8000, reload=True)
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(
+        "server:app",
+        host="0.0.0.0",
+        port=port,
+        reload=True,
+    )
